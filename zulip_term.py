@@ -137,7 +137,7 @@ import collections
 # --- Stream abbreviations for notification bar ---
 STREAM_ABBREVIATIONS = {
     "System Notifications": "SN",
-    "Ticket updates": "TA",
+    "Ticket updates": "TU",
     "Development": "DEV",
     "IT": "IT",
     "Mail Security": "MS",
