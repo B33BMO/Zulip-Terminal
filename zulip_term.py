@@ -17,7 +17,8 @@ def check_and_install_packages():
             python_exe = sys.executable
             for pkg in missing:
                 print(f"Installing {pkg}...")
-                subprocess.check_call([python_exe, "-m", "pip", "install", pkg])
+                # Always use --break-system-packages to allow install in system python (e.g. Ubuntu/Debian)
+                subprocess.check_call([python_exe, "-m", "pip", "install", "--break-system-packages", pkg])
             print("All dependencies installed. Please restart the script.")
             sys.exit(0)
         else:
