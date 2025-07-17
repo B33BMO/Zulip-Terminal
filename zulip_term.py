@@ -29,6 +29,35 @@ def check_and_install_packages():
 check_and_install_packages()
 
 import zulip
+import queue
+event_queue = queue.Queue()
+def global_event_handler(event):
+    if event['type'] == 'message':
+        msg = event['message']
+        print(f"[DEBUG][EVENT] MSG: {msg}")
+        # Only count messages not sent by self
+        if msg.get('sender_email') and msg['sender_email'] != client.email:
+            if msg['type'] == 'stream':
+                key = _get_stream_topic_key(msg['display_recipient'], msg['subject'])
+                print(f"[DEBUG][EVENT] Adding to unread: {key}")
+                unread_tracker[key] = unread_tracker.get(key, 0) + 1
+                print(f"[DEBUG][EVENT] UNREAD TRACKER NOW: {unread_tracker}")
+            elif msg['type'] == 'private':
+                if isinstance(msg['display_recipient'], list):
+                    emails = [u['email'] for u in msg['display_recipient'] if u['email'] != client.email]
+                else:
+                    emails = [msg['display_recipient']] if msg['display_recipient'] != client.email else []
+                key = _get_dm_key(emails)
+                print(f"[DEBUG][EVENT] Adding to unread (DM): {key}")
+                unread_tracker[key] = unread_tracker.get(key, 0) + 1
+                print(f"[DEBUG][EVENT] UNREAD TRACKER NOW: {unread_tracker}")
+            else:
+                print(f"[DEBUG][EVENT] Unknown msg type: {msg['type']}")
+        # (optional) Queue up for UI update
+        event_queue.put("update_notifybar")
+
+def run_global_event_loop():
+    client.call_on_each_event(global_event_handler, event_types=["message"])
 import os
 import threading
 import time
@@ -165,7 +194,7 @@ def notifybar_text():
 
 # Notification bar control and window
 notifybar_control = FormattedTextControl(text=notifybar_text)
-notifybar_window = Window(content=notifybar_control, style='class:notifybar', width=21, always_hide_cursor=True)
+notifybar_window = Window(content=notifybar_control, style='class:notifybar', width=25, always_hide_cursor=True)
 
 def get_users():
     resp = client.get_users()
@@ -215,6 +244,16 @@ def clean_message_html(content):
     for tag in soup.find_all(['img', 'div', 'span']):
         tag.decompose()
     cleaned = soup.get_text(separator=" ", strip=True)
+    import re
+    # --- Zulip image link patch ---
+    # Find Zulip image upload paths and convert to OSC 8 hyperlink (filename clickable)
+    def make_link(m):
+        path = m.group(1)
+        filename = path.split("/")[-1]
+        url = f"https://zulip.cyburity.com{path}"
+        # Use OSC 8 hyperlink: makes just 'filename' clickable in the terminal
+        return f"\x1b]8;;{url}\x1b\\{filename}\x1b]8;;\x1b\\"
+    cleaned = re.sub(r"(/user_uploads/[^\s)]+)", make_link, cleaned)
     return " ".join(cleaned.split())
 
 sidebar_users = {
@@ -308,11 +347,21 @@ def render_visible_messages():
     # STEP 1: Prepend system banner if only stream is selected (no topic)
     if chat_state.get('current_stream') and not chat_state.get('current_topic'):
         lines.append(('', f"[System]: Viewing ALL topics in stream: {chat_state['current_stream']} (Read-only, pick a topic to send a message)\n"))
+    prev_sender = None
     for msg in visible:
         if msg.get('id', None) == -1:
             lines.append(('', f"[System]: {msg.get('content', '')}\n"))
+            # Always add a blank line after system messages
+            lines.append(('', '\n'))
+            prev_sender = None
         else:
+            # If sender changes (and not first message), insert blank line for separation
+            if prev_sender is not None and prev_sender != msg['sender_full_name']:
+                lines.append(('', '\n'))
             lines += msg_to_fmt(msg)
+            # Always add a blank line after each message for extra padding
+            lines.append(('', '\n'))
+            prev_sender = msg['sender_full_name']
     return lines
 
 def is_at_bottom():
@@ -469,11 +518,7 @@ def append_new_messages():
         new_msgs = [msg for msg in res['messages'] if msg['id'] > last_id and msg['id'] not in msg_id_set]
         if new_msgs:
             for msg in new_msgs:
-                print(f"[DEBUG] New incoming message: {msg}")
-                if not msg.get('sender_email'):
-                    print("[DEBUG] sender_email missing from msg!")
-                elif msg['sender_email'] == client.email:
-                    print("[DEBUG] Skipping (sent by self)")
+                print(f"[DEBUG] MSG: {msg}")  # NEW: See what comes in
                 msg_history.append(msg)
                 msg_id_set.add(msg['id'])
                 # --- Unread tracking ---
@@ -481,18 +526,19 @@ def append_new_messages():
                 if msg.get('sender_email') and msg['sender_email'] != client.email:
                     if msg['type'] == 'stream':
                         key = _get_stream_topic_key(msg['display_recipient'], msg['subject'])
+                        print(f"[DEBUG] Adding to unread: {key}")
                         unread_tracker[key] = unread_tracker.get(key, 0) + 1
-                        print(f"[DEBUG] INCREMENTED unread: {key} -> {unread_tracker[key]}")
+                        print(f"[DEBUG] UNREAD TRACKER NOW: {unread_tracker}")
                     elif msg['type'] == 'private':
                         # For 1:1 or group PMs, get all emails except self
                         if isinstance(msg['display_recipient'], list):
                             emails = [u['email'] for u in msg['display_recipient'] if u['email'] != client.email]
                         else:
-                            # Fallback: single recipient
                             emails = [msg['display_recipient']] if msg['display_recipient'] != client.email else []
                         key = _get_dm_key(emails)
+                        print(f"[DEBUG] Adding to unread (DM): {key}")
                         unread_tracker[key] = unread_tracker.get(key, 0) + 1
-                        print(f"[DEBUG] INCREMENTED unread: {key} -> {unread_tracker[key]}")
+                        print(f"[DEBUG] UNREAD TRACKER NOW: {unread_tracker}")
                     else:
                         print(f"[DEBUG] Unknown msg type: {msg['type']}")
             return True
@@ -776,6 +822,9 @@ def main():
     print_system("--- ZULIP TERMINAL CLIENT ---")
     print_system("Commands: /stream /topic /dm [name] /search <query> /exit")
     print_system("Type messages and hit Enter. Scroll with Up/Down/PageUp/PageDown. Switch context with /stream or /dm.")
+    # Start global event loop thread before launching UI
+    t_event = threading.Thread(target=run_global_event_loop, daemon=True)
+    t_event.start()
     app = Application(layout=layout, key_bindings=kb, style=style, full_screen=True)
     t1 = threading.Thread(target=fetch_new_messages_loop, daemon=True)
     t2 = threading.Thread(target=update_sidebar, daemon=True)
