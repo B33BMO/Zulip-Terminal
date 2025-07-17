@@ -28,7 +28,6 @@ def check_and_install_packages():
 check_and_install_packages()
 
 import zulip
-import itertools
 import os
 import threading
 import time
@@ -144,115 +143,6 @@ stop_event = threading.Event()
 def update_visible_window_size():
     # No-op: window size is fixed to avoid scrolling bug.
     pass
-
-# --------- Sidebar Data State ---------
-sidebar_state = {
-    "dms": [],
-    "streams": [],
-    "unread_dm_counts": {},
-    "unread_stream_counts": {},
-    "selected_idx": 0,
-    "mode": "sidebar",  # "sidebar" or "chat"
-}
-sidebar_section_break_idx = 0  # DM count (so streams start here in index)
-
-# --------- Sidebar Data Fetching ---------
-def refresh_sidebar_data():
-    # DMs
-    dms = []
-    try:
-        resp = client.call_endpoint('users/me/conversations', method='GET', request={'anchor': 'newest', 'num_before': 50, 'num_after': 0})
-        convs = resp.get("conversations", [])
-        for conv in convs:
-            user_ids = conv['user_ids']
-            # Exclude yourself from names
-            names = [user_map.get(u, {}).get('full_name', str(u)) for u in user_ids if u in user_map and user_map[u]['email'] != client.email]
-            if not names: names = [client.email]
-            unread = conv.get('unread_count', 0)
-            dms.append({'user_ids': user_ids, 'names': names, 'unread': unread, 'raw': conv})
-    except Exception:
-        # Fallback: just empty list if endpoint not available
-        dms = []
-    dms = sorted(dms, key=lambda x: -x['unread'])
-    sidebar_state['dms'] = dms[:5]
-    global sidebar_section_break_idx
-    sidebar_section_break_idx = len(sidebar_state['dms'])
-
-    # Streams
-    s_unread = {}
-    s_names = []
-    try:
-        unread = client.get_unread_messages()
-        for s in unread.get('streams', []):
-            s_unread[s['stream_name']] = len(s['unread_message_ids'])
-    except Exception:
-        pass
-    for s in streams:
-        s_names.append(s)
-    sidebar_state['streams'] = s_names
-    sidebar_state['unread_stream_counts'] = s_unread
-
-    # Unread DM counts
-    dm_unread = {}
-    for dm in dms:
-        key = ','.join(map(str, dm['user_ids']))
-        dm_unread[key] = dm['unread']
-    sidebar_state['unread_dm_counts'] = dm_unread
-
-# Sidebar rendering function
-def left_sidebar_text():
-    out = []
-    out.append(('class:sidebar', "── DMs / Groups ──\n"))
-    for i, dm in enumerate(sidebar_state['dms']):
-        name = ', '.join(dm['names'])
-        count = dm['unread']
-        badge = f" ({count})" if count > 0 else ""
-        style = 'reverse' if sidebar_state['mode']=="sidebar" and sidebar_state['selected_idx']==i else 'class:sidebar'
-        out.append((style, f"{name}{badge}\n"))
-    out.append(('class:sidebar', "─── Streams ─────\n"))
-    for j, stream in enumerate(sidebar_state['streams']):
-        idx = j + sidebar_section_break_idx
-        count = sidebar_state['unread_stream_counts'].get(stream, 0)
-        badge = f" ({count})" if count > 0 else ""
-        style = 'reverse' if sidebar_state['mode']=="sidebar" and sidebar_state['selected_idx']==idx else 'class:sidebar'
-        out.append((style, f"{stream}{badge}\n"))
-    return out
-
-# Navigation logic
-def move_sidebar_selection(delta):
-    idx = sidebar_state['selected_idx']
-    max_idx = len(sidebar_state['dms']) + len(sidebar_state['streams']) - 1
-    idx = max(0, min(idx + delta, max_idx))
-    sidebar_state['selected_idx'] = idx
-
-def activate_sidebar_selected():
-    idx = sidebar_state['selected_idx']
-    if idx < len(sidebar_state['dms']):
-        dm = sidebar_state['dms'][idx]
-        # Pick first user ID that's not self
-        recipients = [u for u in dm['user_ids'] if user_map.get(u, {}).get('email','') != client.email]
-        if recipients:
-            # Find email of first recipient
-            emails = [user_map[u]['email'] for u in recipients if u in user_map]
-            if emails:
-                chat_state['current_dm'] = emails[0]  # support only single for now
-                chat_state['current_stream'] = None
-                chat_state['current_topic'] = None
-                load_all_messages()
-                global chat_scroll_pos
-                chat_scroll_pos = 0
-                print_system(f"(Switched to DM with: {emails[0]})")
-    else:
-        s_idx = idx - len(sidebar_state['dms'])
-        if 0 <= s_idx < len(sidebar_state['streams']):
-            sname = sidebar_state['streams'][s_idx]
-            chat_state['current_stream'] = sname
-            chat_state['current_topic'] = None
-            chat_state['current_dm'] = None
-            load_all_messages()
-            chat_scroll_pos
-            chat_scroll_pos = 0
-            print_system(f"(Selected stream: {sname})")
 
 
 
@@ -473,13 +363,8 @@ def append_new_messages():
 
 
 
-from prompt_toolkit.layout import Dimension
-left_sidebar_control = FormattedTextControl(text=left_sidebar_text)
-left_sidebar_window = Window(content=left_sidebar_control, style='class:sidebar', width=32, always_hide_cursor=True, wrap_lines=False)
-
-# Add a right bar for presence if you want
-right_sidebar_control = FormattedTextControl(text=sidebar_text)
-right_sidebar_window = Window(content=right_sidebar_control, style='class:sidebar', width=28, always_hide_cursor=True)
+sidebar_control = FormattedTextControl(text=sidebar_text)
+sidebar_window = Window(content=sidebar_control, style='class:sidebar', width=28, always_hide_cursor=True)
 
 # Adds @mention autocomplete for users using Zulip mention syntax -- untested!!
 class ZulipCompleter(Completer):
@@ -527,70 +412,64 @@ input_control = BufferControl(buffer=input_buffer, focus_on_click=True)
 input_window = Window(content=input_control, height=1, style='class:input')
 
 body = VSplit([
-    left_sidebar_window,
     HSplit([
         Frame(chat_window, title="Chat", style="class:output"),
         Frame(input_window, title="Message", style="class:prompt"),
     ]),
-    right_sidebar_window,
+    Frame(sidebar_window, title="Presence", style='class:sidebar'),
 ])
 
 layout = Layout(container=body, focused_element=input_window)
 kb = KeyBindings()
 
-
-# --- Key bindings ---
-@kb.add('c-left')
-def sidebar_focus(event):
-    sidebar_state['mode'] = "sidebar"
-    event.app.layout.focus(left_sidebar_window)
-
-@kb.add('c-right')
-def chat_focus(event):
-    sidebar_state['mode'] = "chat"
-    event.app.layout.focus(input_window)
-
 @kb.add('up')
-def sidebar_up(event):
-    if sidebar_state['mode'] == "sidebar":
-        move_sidebar_selection(-1)
+def scroll_up(event):
+    global chat_scroll_pos
+    # If we are at the oldest visible message, lazy load more
+    if chat_scroll_pos + 1 >= len(msg_history) - VISIBLE_WINDOW + 1:
+        loaded = lazy_load_older_messages()
+        if loaded:
+            # Keep you at the same visual spot
+            chat_scroll_pos += len([m for m in msg_history if isinstance(m, dict) and 'id' in m]) - len(msg_history)
         event.app.invalidate()
-    else:
-        # chat scroll
-        global chat_scroll_pos
-        if chat_scroll_pos + 1 < len(msg_history) - VISIBLE_WINDOW + 1:
-            chat_scroll_pos += 1
-            event.app.invalidate()
+    elif chat_scroll_pos + 1 < len(msg_history) - VISIBLE_WINDOW + 1:
+        chat_scroll_pos += 1
+        event.app.invalidate()
 
 @kb.add('down')
-def sidebar_down(event):
-    if sidebar_state['mode'] == "sidebar":
-        move_sidebar_selection(1)
+def scroll_down(event):
+    global chat_scroll_pos
+    if chat_scroll_pos > 0:
+        chat_scroll_pos -= 1
         event.app.invalidate()
-    else:
-        # chat scroll
-        global chat_scroll_pos
-        if chat_scroll_pos > 0:
-            chat_scroll_pos -= 1
-            event.app.invalidate()
+
+@kb.add('pageup')
+def page_up(event):
+    global chat_scroll_pos
+    page = 10
+    before = chat_scroll_pos
+    for _ in range(page):
+        kb.get_bindings_for_keys(('up',))[0].handler(event)
+    event.app.invalidate()
+
+@kb.add('pagedown')
+def page_down(event):
+    global chat_scroll_pos
+    page = 10
+    for _ in range(page):
+        kb.get_bindings_for_keys(('down',))[0].handler(event)
+    event.app.invalidate()
 
 @kb.add('enter')
-def sidebar_select(event):
-    if sidebar_state['mode'] == "sidebar":
-        activate_sidebar_selected()
-        sidebar_state['mode'] = "chat"
-        event.app.layout.focus(input_window)
-        event.app.invalidate()
-    else:
-        # normal chat input enter
-        text = input_buffer.text.strip()
-        if not text: return
-        input_buffer.text = ''
-        ret = process_command(text)
-        append_new_messages()
-        event.app.invalidate()
-        if ret == "exit":
-            event.app.exit()
+def accept_input(event):
+    text = input_buffer.text.strip()
+    if not text: return
+    input_buffer.text = ''
+    ret = process_command(text)
+    append_new_messages()
+    event.app.invalidate()
+    if ret == "exit":
+        event.app.exit()
 
 def get_email_from_name(name):
     for u in users:
@@ -729,23 +608,15 @@ def refresh_sidebar(app):
         time.sleep(2)
 
 
-def sidebar_data_refresh_loop():
-    while not stop_event.is_set():
-        refresh_sidebar_data()
-        left_sidebar_control.text = left_sidebar_text
-        time.sleep(5)
-
 def main():
     print_system("--- ZULIP TERMINAL CLIENT ---")
     print_system("Commands: /stream /topic /dm [name] /search <query> /exit")
     print_system("Type messages and hit Enter. Scroll with Up/Down/PageUp/PageDown. Switch context with /stream or /dm.")
-    print_system("Sidebar: Use Ctrl+Left/Right to move focus. Up/Down to navigate. Enter to switch chat.")
     app = Application(layout=layout, key_bindings=kb, style=style, full_screen=True)
     t1 = threading.Thread(target=fetch_new_messages_loop, daemon=True)
     t2 = threading.Thread(target=update_sidebar, daemon=True)
     t3 = threading.Thread(target=refresh_sidebar, args=(app,), daemon=True)
-    t4 = threading.Thread(target=sidebar_data_refresh_loop, daemon=True)
-    t1.start(); t2.start(); t3.start(); t4.start()
+    t1.start(); t2.start(); t3.start()
     with patch_stdout():
         app.run()
     stop_event.set()
