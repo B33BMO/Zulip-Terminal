@@ -250,7 +250,7 @@ def activate_sidebar_selected():
             chat_state['current_topic'] = None
             chat_state['current_dm'] = None
             load_all_messages()
-            global chat_scroll_pos
+            chat_scroll_pos
             chat_scroll_pos = 0
             print_system(f"(Selected stream: {sname})")
 
