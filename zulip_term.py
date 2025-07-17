@@ -1,3 +1,16 @@
+import subprocess
+import os
+try:
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    subprocess.run(
+        ["git", "-C", repo_dir, "pull"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+except Exception:
+    pass
+
 prefetch_history_enabled = True  # Toggle this if you want to enable/disable auto-fetching old messages
 import sys
 import subprocess
@@ -34,25 +47,20 @@ event_queue = queue.Queue()
 def global_event_handler(event):
     if event['type'] == 'message':
         msg = event['message']
-        print(f"[DEBUG][EVENT] MSG: {msg}")
         # Only count messages not sent by self
         if msg.get('sender_email') and msg['sender_email'] != client.email:
             if msg['type'] == 'stream':
                 key = _get_stream_topic_key(msg['display_recipient'], msg['subject'])
-                print(f"[DEBUG][EVENT] Adding to unread: {key}")
                 unread_tracker[key] = unread_tracker.get(key, 0) + 1
-                print(f"[DEBUG][EVENT] UNREAD TRACKER NOW: {unread_tracker}")
             elif msg['type'] == 'private':
                 if isinstance(msg['display_recipient'], list):
                     emails = [u['email'] for u in msg['display_recipient'] if u['email'] != client.email]
                 else:
                     emails = [msg['display_recipient']] if msg['display_recipient'] != client.email else []
                 key = _get_dm_key(emails)
-                print(f"[DEBUG][EVENT] Adding to unread (DM): {key}")
                 unread_tracker[key] = unread_tracker.get(key, 0) + 1
-                print(f"[DEBUG][EVENT] UNREAD TRACKER NOW: {unread_tracker}")
             else:
-                print(f"[DEBUG][EVENT] Unknown msg type: {msg['type']}")
+                pass
         # (optional) Queue up for UI update
         event_queue.put("update_notifybar")
 
@@ -92,7 +100,6 @@ try:
     client.email = client.email if hasattr(client, 'email') else client.get_profile()['email']
 except Exception:
     client.email = None
-print(f"[DEBUG] This client is using Zulip email: {client.email}")
 #
 # Fixes scrolling bug by using fixed window size
 VISIBLE_WINDOW = 14
@@ -126,6 +133,19 @@ style = Style.from_dict({
     'notify_friendly':  'italic #aaaaff',
 })
 import collections
+
+# --- Stream abbreviations for notification bar ---
+STREAM_ABBREVIATIONS = {
+    "System Notifications": "SN",
+    "Ticket updates": "TA",
+    "Development": "DEV",
+    "IT": "IT",
+    "Mail Security": "MS",
+    "Monitoring": "MON",
+    "Client Updating": "CU",
+    # Add more as you wish!
+}
+
 notifybar_lock = threading.Lock()
 notifybar_data = []
 
@@ -165,6 +185,23 @@ def get_unread_counts():
                 counts.append(('dm', label, count))
     return counts
 
+# Format notification label for notifybar
+def format_notify_label(label):
+    # Handles "stream:topic" and "dm:Name" forms
+    if ":" in label:
+        stream, topic = label.split(":", 1)
+        abbrev = STREAM_ABBREVIATIONS.get(stream, stream)
+        topic = topic.strip()
+        if len(topic) > 16:
+            topic = topic[:13] + "..."
+        if len(abbrev) > 8:
+            abbrev = abbrev[:7] + "."
+        return f"{abbrev}:{topic}"
+    else:
+        if len(label) > 18:
+            return label[:15] + "..."
+        return label
+
 # Notification bar: right sidebar
 def notifybar_text():
     with notifybar_lock:
@@ -175,10 +212,11 @@ def notifybar_text():
         out.append(('class:notify_friendly', "  No notifications!\n"))
     else:
         for typ, label, count in items:
+            display_label = format_notify_label(label)
             if typ == 'stream':
-                label_fmt = [('class:notify_stream', f"{label}")]
+                label_fmt = [('class:notify_stream', f"{display_label}")]
             else:
-                label_fmt = [('class:notify_dm', f"{label}")]
+                label_fmt = [('class:notify_dm', f"{display_label}")]
             # Color for count
             if count > 9:
                 count_fmt = ('class:notify_count_high', f"({count})")
@@ -194,7 +232,7 @@ def notifybar_text():
 
 # Notification bar control and window
 notifybar_control = FormattedTextControl(text=notifybar_text)
-notifybar_window = Window(content=notifybar_control, style='class:notifybar', width=25, always_hide_cursor=True)
+notifybar_window = Window(content=notifybar_control, style='class:notifybar', width=31, always_hide_cursor=True)
 
 def get_users():
     resp = client.get_users()
@@ -518,7 +556,6 @@ def append_new_messages():
         new_msgs = [msg for msg in res['messages'] if msg['id'] > last_id and msg['id'] not in msg_id_set]
         if new_msgs:
             for msg in new_msgs:
-                print(f"[DEBUG] MSG: {msg}")  # NEW: See what comes in
                 msg_history.append(msg)
                 msg_id_set.add(msg['id'])
                 # --- Unread tracking ---
@@ -526,9 +563,7 @@ def append_new_messages():
                 if msg.get('sender_email') and msg['sender_email'] != client.email:
                     if msg['type'] == 'stream':
                         key = _get_stream_topic_key(msg['display_recipient'], msg['subject'])
-                        print(f"[DEBUG] Adding to unread: {key}")
                         unread_tracker[key] = unread_tracker.get(key, 0) + 1
-                        print(f"[DEBUG] UNREAD TRACKER NOW: {unread_tracker}")
                     elif msg['type'] == 'private':
                         # For 1:1 or group PMs, get all emails except self
                         if isinstance(msg['display_recipient'], list):
@@ -536,11 +571,9 @@ def append_new_messages():
                         else:
                             emails = [msg['display_recipient']] if msg['display_recipient'] != client.email else []
                         key = _get_dm_key(emails)
-                        print(f"[DEBUG] Adding to unread (DM): {key}")
                         unread_tracker[key] = unread_tracker.get(key, 0) + 1
-                        print(f"[DEBUG] UNREAD TRACKER NOW: {unread_tracker}")
                     else:
-                        print(f"[DEBUG] Unknown msg type: {msg['type']}")
+                        pass
             return True
     return False
 
