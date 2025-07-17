@@ -1,3 +1,4 @@
+prefetch_history_enabled = True  # Toggle this if you want to enable/disable auto-fetching old messages
 import sys
 import subprocess
 
@@ -57,6 +58,12 @@ if not os.path.exists(CONFIG):
     sys.exit(0)
 
 client = zulip.Client(config_file=CONFIG)
+# Print out the Zulip email for debugging
+try:
+    client.email = client.email if hasattr(client, 'email') else client.get_profile()['email']
+except Exception:
+    client.email = None
+print(f"[DEBUG] This client is using Zulip email: {client.email}")
 #
 # Fixes scrolling bug by using fixed window size
 VISIBLE_WINDOW = 14
@@ -81,7 +88,84 @@ style = Style.from_dict({
     'user_5':           'bold cyan',
     'user_6':           'bold white',
     'user_7':           'bold #888888',
+    'notifybar':        '#ffffff',
+    'notify_count':     'bold #ffff00',
+    'notify_count_high':'bold #ff3333',
+    'notify_none':      '#888888',
+    'notify_stream':    '#5ad',
+    'notify_dm':        '#ffb347',
+    'notify_friendly':  'italic #aaaaff',
 })
+import collections
+notifybar_lock = threading.Lock()
+notifybar_data = []
+
+# --- Unread tracking logic ---
+# Module-level tracker for unread counts
+unread_tracker = {}
+
+def _get_stream_topic_key(stream, topic):
+    return f"stream:{stream}:{topic}"
+
+def _get_dm_key(user_emails):
+    # user_emails: list of emails (excluding self)
+    # Sort for canonical order, map to full names
+    names = []
+    for email in sorted(user_emails):
+        for u in users:
+            if u['email'] == email:
+                names.append(u['full_name'])
+    return "dm:" + ",".join(names)
+
+def mark_convo_as_read(key):
+    # Reset unread count for a given key
+    if key in unread_tracker:
+        unread_tracker[key] = 0
+
+def get_unread_counts():
+    # Returns: list of tuples: (type, label, count)
+    # Only include counts > 0
+    counts = []
+    for key, count in unread_tracker.items():
+        if count > 0:
+            if key.startswith("stream:"):
+                _, stream, topic = key.split(":", 2)
+                counts.append(('stream', f"{stream}:{topic}", count))
+            elif key.startswith("dm:"):
+                label = key[3:]
+                counts.append(('dm', label, count))
+    return counts
+
+# Notification bar: right sidebar
+def notifybar_text():
+    with notifybar_lock:
+        items = list(notifybar_data)
+    out = []
+    out.append(('class:notifybar', "\n"))
+    if not items:
+        out.append(('class:notify_friendly', "  No notifications!\n"))
+    else:
+        for typ, label, count in items:
+            if typ == 'stream':
+                label_fmt = [('class:notify_stream', f"{label}")]
+            else:
+                label_fmt = [('class:notify_dm', f"{label}")]
+            # Color for count
+            if count > 9:
+                count_fmt = ('class:notify_count_high', f"({count})")
+            else:
+                count_fmt = ('class:notify_count', f"({count})")
+            out.append(('class:notifybar', "  "))
+            out.extend(label_fmt)
+            out.append(('class:notifybar', ":"))
+            out.append(count_fmt)
+            out.append(('class:notifybar', "\n"))
+    out.append(('class:notifybar', "────────────────────────\n"))
+    return out
+
+# Notification bar control and window
+notifybar_control = FormattedTextControl(text=notifybar_text)
+notifybar_window = Window(content=notifybar_control, style='class:notifybar', width=21, always_hide_cursor=True)
 
 def get_users():
     resp = client.get_users()
@@ -221,6 +305,9 @@ def render_visible_messages():
         visible = real_msgs[start:end]
 
     lines = []
+    # STEP 1: Prepend system banner if only stream is selected (no topic)
+    if chat_state.get('current_stream') and not chat_state.get('current_topic'):
+        lines.append(('', f"[System]: Viewing ALL topics in stream: {chat_state['current_stream']} (Read-only, pick a topic to send a message)\n"))
     for msg in visible:
         if msg.get('id', None) == -1:
             lines.append(('', f"[System]: {msg.get('content', '')}\n"))
@@ -255,8 +342,12 @@ def load_all_messages():
             {"operator": "stream", "operand": current_stream},
             {"operator": "topic", "operand": current_topic},
         ]
+    elif current_stream:
+        narrow = [
+            {"operator": "stream", "operand": current_stream}
+        ]
     else:
-        print_system("Pick a DM or stream/topic first.")
+        print_system("Pick a DM or stream first.")
         return
 
     res = client.get_messages({
@@ -282,6 +373,10 @@ def load_all_messages():
     chat_scroll_pos = 0
     print_system(f"(Loaded {len(msg_history)} messages.)")
 
+    # NEW: Start background prefetch of old messages
+    if prefetch_history_enabled:
+        threading.Thread(target=auto_fetch_history, daemon=True).start()
+
 
 # Lazy load older messages for scrolling up
 def lazy_load_older_messages():
@@ -298,6 +393,10 @@ def lazy_load_older_messages():
         narrow = [
             {"operator": "stream", "operand": current_stream},
             {"operator": "topic", "operand": current_topic},
+        ]
+    elif current_stream:
+        narrow = [
+            {"operator": "stream", "operand": current_stream}
         ]
     else:
         return False
@@ -323,6 +422,20 @@ def lazy_load_older_messages():
     earliest_msg_id = msg_history[0]['id']
     print_system(f"(Loaded {len(messages)} older messages.)")
     return True
+
+
+# Auto-fetch history in background
+def auto_fetch_history():
+    global earliest_msg_id
+    while not stop_event.is_set():
+        if earliest_msg_id is None:
+            break
+        loaded = lazy_load_older_messages()
+        if not loaded:
+            break
+        # Optionally print status to chat window
+        print_system("(Auto-loading older chat history...)")
+        time.sleep(0.5)  # Avoid hammering the API
 
 def append_new_messages():
     global msg_history, msg_id_set, chat_scroll_pos
@@ -356,8 +469,32 @@ def append_new_messages():
         new_msgs = [msg for msg in res['messages'] if msg['id'] > last_id and msg['id'] not in msg_id_set]
         if new_msgs:
             for msg in new_msgs:
+                print(f"[DEBUG] New incoming message: {msg}")
+                if not msg.get('sender_email'):
+                    print("[DEBUG] sender_email missing from msg!")
+                elif msg['sender_email'] == client.email:
+                    print("[DEBUG] Skipping (sent by self)")
                 msg_history.append(msg)
                 msg_id_set.add(msg['id'])
+                # --- Unread tracking ---
+                # Don't count messages sent by self
+                if msg.get('sender_email') and msg['sender_email'] != client.email:
+                    if msg['type'] == 'stream':
+                        key = _get_stream_topic_key(msg['display_recipient'], msg['subject'])
+                        unread_tracker[key] = unread_tracker.get(key, 0) + 1
+                        print(f"[DEBUG] INCREMENTED unread: {key} -> {unread_tracker[key]}")
+                    elif msg['type'] == 'private':
+                        # For 1:1 or group PMs, get all emails except self
+                        if isinstance(msg['display_recipient'], list):
+                            emails = [u['email'] for u in msg['display_recipient'] if u['email'] != client.email]
+                        else:
+                            # Fallback: single recipient
+                            emails = [msg['display_recipient']] if msg['display_recipient'] != client.email else []
+                        key = _get_dm_key(emails)
+                        unread_tracker[key] = unread_tracker.get(key, 0) + 1
+                        print(f"[DEBUG] INCREMENTED unread: {key} -> {unread_tracker[key]}")
+                    else:
+                        print(f"[DEBUG] Unknown msg type: {msg['type']}")
             return True
     return False
 
@@ -412,14 +549,28 @@ input_control = BufferControl(buffer=input_buffer, focus_on_click=True)
 input_window = Window(content=input_control, height=1, style='class:input')
 
 body = VSplit([
+    Frame(sidebar_window, title="Presence", style='class:sidebar'),
     HSplit([
         Frame(chat_window, title="Chat", style="class:output"),
         Frame(input_window, title="Message", style="class:prompt"),
     ]),
-    Frame(sidebar_window, title="Presence", style='class:sidebar'),
+    Frame(notifybar_window, title="Notifications", style='class:notifybar'),
 ])
 
 layout = Layout(container=body, focused_element=input_window)
+def update_notifybar():
+    while not stop_event.is_set():
+        unread = get_unread_counts()
+        with notifybar_lock:
+            notifybar_data.clear()
+            notifybar_data.extend(unread)
+        time.sleep(2)
+
+def refresh_notifybar(app):
+    while not stop_event.is_set():
+        notifybar_control.text = notifybar_text()
+        app.invalidate()
+        time.sleep(2)
 kb = KeyBindings()
 
 @kb.add('up')
@@ -502,6 +653,9 @@ def process_command(cmd):
             load_all_messages()
             chat_scroll_pos = 0
             print_system(f"(Selected topic: {arg})")
+            # Mark stream:topic as read when opened
+            key = _get_stream_topic_key(chat_state['current_stream'], chat_state['current_topic'])
+            mark_convo_as_read(key)
         else:
             print_system("(Invalid topic. Use tab for options.)")
     elif cmd.startswith("/dm"):
@@ -514,6 +668,9 @@ def process_command(cmd):
             load_all_messages()
             chat_scroll_pos = 0
             print_system(f"(Switched to DM with: {arg})")
+            # Mark DM as read when opened
+            key = _get_dm_key([email])
+            mark_convo_as_read(key)
         else:
             print_system("(User not found. Use tab for options.)")
     elif cmd.startswith("/search"):
@@ -556,6 +713,9 @@ def process_command(cmd):
                 load_all_messages()       # <-- FULL reload, always!
                 chat_scroll_pos = 0       # <-- Snap to bottom
                 print_system("(sent)")
+                # Mark DM as read after sending
+                key = _get_dm_key([chat_state['current_dm']])
+                mark_convo_as_read(key)
         elif chat_state['current_stream'] and chat_state['current_topic']:
             res = client.send_message({
                 "type": "stream",
@@ -567,6 +727,10 @@ def process_command(cmd):
                 load_all_messages()
                 chat_scroll_pos = 0
                 print_system("(sent)")
+                key = _get_stream_topic_key(chat_state['current_stream'], chat_state['current_topic'])
+                mark_convo_as_read(key)
+        elif chat_state['current_stream'] and not chat_state['current_topic']:
+            print_system("(Pick a topic before sending a message to a stream!)")
         else:
             print_system("(Pick a stream/topic or DM first!)")
 
@@ -616,7 +780,9 @@ def main():
     t1 = threading.Thread(target=fetch_new_messages_loop, daemon=True)
     t2 = threading.Thread(target=update_sidebar, daemon=True)
     t3 = threading.Thread(target=refresh_sidebar, args=(app,), daemon=True)
-    t1.start(); t2.start(); t3.start()
+    t4 = threading.Thread(target=update_notifybar, daemon=True)
+    t5 = threading.Thread(target=refresh_notifybar, args=(app,), daemon=True)
+    t1.start(); t2.start(); t3.start(); t4.start(); t5.start()
     with patch_stdout():
         app.run()
     stop_event.set()
