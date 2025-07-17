@@ -11,7 +11,7 @@ try:
 except Exception:
     pass
 
-prefetch_history_enabled = True  # Toggle this if you want to enable/disable auto-fetching old messages
+prefetch_history_enabled = True  
 import sys
 import subprocess
 
@@ -31,7 +31,7 @@ def check_and_install_packages():
             python_exe = sys.executable
             for pkg in missing:
                 print(f"Installing {pkg}...")
-                # Always use --break-system-packages to allow install in system python (e.g. Ubuntu/Debian)
+                # Always use --break-system-packages to allow install in system python because FUCK envs!!!
                 subprocess.check_call([python_exe, "-m", "pip", "install", "--break-system-packages", pkg])
             print("All dependencies installed. Please restart the script.")
             sys.exit(0)
@@ -61,7 +61,7 @@ def global_event_handler(event):
                 unread_tracker[key] = unread_tracker.get(key, 0) + 1
             else:
                 pass
-        # (optional) Queue up for UI update
+        #Queue up for UI update
         event_queue.put("update_notifybar")
 
 def run_global_event_loop():
@@ -143,7 +143,6 @@ STREAM_ABBREVIATIONS = {
     "Mail Security": "MS",
     "Monitoring": "MON",
     "Client Updating": "CU",
-    # Add more as you wish!
 }
 
 notifybar_lock = threading.Lock()
@@ -172,7 +171,7 @@ def mark_convo_as_read(key):
         unread_tracker[key] = 0
 
 def get_unread_counts():
-    # Returns: list of tuples: (type, label, count)
+    # Returns: list of tuples
     # Only include counts > 0
     counts = []
     for key, count in unread_tracker.items():
@@ -284,12 +283,11 @@ def clean_message_html(content):
     cleaned = soup.get_text(separator=" ", strip=True)
     import re
     # --- Zulip image link patch ---
-    # Find Zulip image upload paths and convert to OSC 8 hyperlink (filename clickable)
+    # Find Zulip image upload paths and convert to OSC 8 hyperlink broken... ish
     def make_link(m):
         path = m.group(1)
         filename = path.split("/")[-1]
         url = f"https://zulip.cyburity.com{path}"
-        # Use OSC 8 hyperlink: makes just 'filename' clickable in the terminal
         return f"\x1b]8;;{url}\x1b\\{filename}\x1b]8;;\x1b\\"
     cleaned = re.sub(r"(/user_uploads/[^\s)]+)", make_link, cleaned)
     return " ".join(cleaned.split())
@@ -302,7 +300,7 @@ sidebar_users = {
 sidebar_lock = threading.Lock()
 stop_event = threading.Event()
 def update_visible_window_size():
-    # No-op: window size is fixed to avoid scrolling bug.
+    #  window size is fixed to avoid scrolling bug. :(
     pass
 
 
@@ -382,7 +380,7 @@ def render_visible_messages():
         visible = real_msgs[start:end]
 
     lines = []
-    # STEP 1: Prepend system banner if only stream is selected (no topic)
+    # Prepend system banner if only stream is selected (no topic)
     if chat_state.get('current_stream') and not chat_state.get('current_topic'):
         lines.append(('', f"[System]: Viewing ALL topics in stream: {chat_state['current_stream']} (Read-only, pick a topic to send a message)\n"))
     prev_sender = None
@@ -460,7 +458,7 @@ def load_all_messages():
     chat_scroll_pos = 0
     print_system(f"(Loaded {len(msg_history)} messages.)")
 
-    # NEW: Start background prefetch of old messages
+    # Start background prefetch of old messages
     if prefetch_history_enabled:
         threading.Thread(target=auto_fetch_history, daemon=True).start()
 
@@ -600,7 +598,7 @@ class ZulipCompleter(Completer):
                             display=f"@{name}",
                             style="fg:green"
                         )
-        # --- Existing completions for / commands ---
+        # --- Existing completions for / commands --- all functional
         if text.startswith('/stream'):
             prefix = text[7:].strip().lower()
             for s in streams:
@@ -659,7 +657,7 @@ def scroll_up(event):
     if chat_scroll_pos + 1 >= len(msg_history) - VISIBLE_WINDOW + 1:
         loaded = lazy_load_older_messages()
         if loaded:
-            # Keep you at the same visual spot
+            # Keep you at the same visual spot - working!!!!
             chat_scroll_pos += len([m for m in msg_history if isinstance(m, dict) and 'id' in m]) - len(msg_history)
         event.app.invalidate()
     elif chat_scroll_pos + 1 < len(msg_history) - VISIBLE_WINDOW + 1:
@@ -747,7 +745,7 @@ def process_command(cmd):
             load_all_messages()
             chat_scroll_pos = 0
             print_system(f"(Switched to DM with: {arg})")
-            # Mark DM as read when opened
+            # Mark DM as read when opened - figgety? Fidgety? Idk
             key = _get_dm_key([email])
             mark_convo_as_read(key)
         else:
@@ -789,7 +787,7 @@ def process_command(cmd):
                 "content": cmd,
             })
             if res['result'] == 'success':
-                load_all_messages()       # <-- FULL reload, always!
+                load_all_messages()       # <-- FULL reload, always! Otherwise... issues
                 chat_scroll_pos = 0       # <-- Snap to bottom
                 print_system("(sent)")
                 # Mark DM as read after sending
@@ -820,16 +818,16 @@ def fetch_new_messages_loop():
     global chat_scroll_pos
     while not stop_event.is_set():
         try:
-            was_at_bottom = is_at_bottom()  # Only check ONCE, before updating
+            was_at_bottom = is_at_bottom()  # Only check ONCE,ONCE, before updating
 
             new_msgs = append_new_messages()
             total_msgs = len([m for m in msg_history if isinstance(m, dict) and 'id' in m])
             max_scroll = max(0, total_msgs - VISIBLE_WINDOW)
 
-            # If you were at bottom AND got new messages, snap to bottom
+            # If youit were at bottom AND got new messages, snap to bottom
             if was_at_bottom and new_msgs:
                 chat_scroll_pos = 0
-            # If NOT at bottom, NEVER force chat_scroll_pos (except clamp if too high)
+            # If NOT at bottom, NEVER force chat_scroll_pos (pain in my ass)
             elif chat_scroll_pos > max_scroll:
                 chat_scroll_pos = max_scroll
             elif chat_scroll_pos < 0:
