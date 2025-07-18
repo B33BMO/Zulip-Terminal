@@ -1,3 +1,35 @@
+
+# Helper to fetch recent DMs (even read ones)
+def fetch_recent_dm_conversations(limit=20):
+    # This returns a list of tuples (label, last_msg_id)
+    try:
+        res = client.get_messages({
+            "anchor": "newest",
+            "num_before": limit,
+            "num_after": 0,
+            "narrow": [{"operator": "is", "operand": "dm"}],
+        })
+        dm_labels = {}
+        for m in res.get("messages", []):
+            if m['type'] == 'private':
+                # Get all user names except self
+                if isinstance(m['display_recipient'], list):
+                    emails = [u['email'] for u in m['display_recipient'] if u['email'] != client.email]
+                else:
+                    emails = [m['display_recipient']] if m['display_recipient'] != client.email else []
+                names = []
+                for email in sorted(emails):
+                    for u in users:
+                        if u['email'] == email:
+                            names.append(u['full_name'])
+                label = ",".join(names)
+                if label:
+                    if label not in dm_labels or m['id'] > dm_labels[label]:
+                        dm_labels[label] = m['id']
+        # Return sorted list (most recent first)
+        return sorted(dm_labels.items(), key=lambda t: -t[1])
+    except Exception as e:
+        return []
 import subprocess
 import os
 try:
@@ -184,54 +216,6 @@ def get_unread_counts():
                 counts.append(('dm', label, count))
     return counts
 
-# Format notification label for notifybar
-def format_notify_label(label):
-    # Handles "stream:topic" and "dm:Name" forms
-    if ":" in label:
-        stream, topic = label.split(":", 1)
-        abbrev = STREAM_ABBREVIATIONS.get(stream, stream)
-        topic = topic.strip()
-        if len(topic) > 16:
-            topic = topic[:13] + "..."
-        if len(abbrev) > 8:
-            abbrev = abbrev[:7] + "."
-        return f"{abbrev}:{topic}"
-    else:
-        if len(label) > 18:
-            return label[:15] + "..."
-        return label
-
-# Notification bar: right sidebar
-def notifybar_text():
-    with notifybar_lock:
-        items = list(notifybar_data)
-    out = []
-    out.append(('class:notifybar', "\n"))
-    if not items:
-        out.append(('class:notify_friendly', "  No notifications!\n"))
-    else:
-        for typ, label, count in items:
-            display_label = format_notify_label(label)
-            if typ == 'stream':
-                label_fmt = [('class:notify_stream', f"{display_label}")]
-            else:
-                label_fmt = [('class:notify_dm', f"{display_label}")]
-            # Color for count
-            if count > 9:
-                count_fmt = ('class:notify_count_high', f"({count})")
-            else:
-                count_fmt = ('class:notify_count', f"({count})")
-            out.append(('class:notifybar', "  "))
-            out.extend(label_fmt)
-            out.append(('class:notifybar', ":"))
-            out.append(count_fmt)
-            out.append(('class:notifybar', "\n"))
-    out.append(('class:notifybar', "────────────────────────\n"))
-    return out
-
-# Notification bar control and window
-notifybar_control = FormattedTextControl(text=notifybar_text)
-notifybar_window = Window(content=notifybar_control, style='class:notifybar', width=31, always_hide_cursor=True)
 
 def get_users():
     resp = client.get_users()
@@ -626,28 +610,78 @@ input_control = BufferControl(buffer=input_buffer, focus_on_click=True)
 input_window = Window(content=input_control, height=1, style='class:input')
 
 body = VSplit([
-    Frame(sidebar_window, title="Presence", style='class:sidebar'),
+    # Leftmost: Conversations list (DMs + Streams)
+    Frame(
+        Window(
+            content=FormattedTextControl(
+                text=lambda: conversations_sidebar_text()
+            ),
+            style='class:sidebar',
+            width=28,
+            always_hide_cursor=True
+        ),
+        title="Conversations",
+        style='class:sidebar'
+    ),
+    # Middle: Chat and input
     HSplit([
         Frame(chat_window, title="Chat", style="class:output"),
         Frame(input_window, title="Message", style="class:prompt"),
     ]),
-    Frame(notifybar_window, title="Notifications", style='class:notifybar'),
+    # Rightmost: Presence sidebar (users)
+    Frame(sidebar_window, title="Presence", style='class:sidebar'),
 ])
 
 layout = Layout(container=body, focused_element=input_window)
-def update_notifybar():
-    while not stop_event.is_set():
-        unread = get_unread_counts()
-        with notifybar_lock:
-            notifybar_data.clear()
-            notifybar_data.extend(unread)
-        time.sleep(2)
 
-def refresh_notifybar(app):
-    while not stop_event.is_set():
-        notifybar_control.text = notifybar_text()
-        app.invalidate()
-        time.sleep(2)
+
+def conversations_sidebar_text():
+    PANEL_WIDTH = 28
+    out = []
+    # --- DMs ---
+    out.append(('class:sidebar', "─── DMs ──────────\n"))
+    # Fetch recent DMs (even read ones!)
+    recent_dms = fetch_recent_dm_conversations(limit=20)
+    # Build unread count map (unchanged)
+    dm_unread = {}
+    for key, count in unread_tracker.items():
+        if key.startswith("dm:"):
+            label = key[3:]
+            dm_unread[label] = count
+    if recent_dms and len(recent_dms) > 0:
+        for label, last_id in recent_dms:
+            unread = dm_unread.get(label, 0)
+            display_label = label
+            if unread > 0:
+                display_label += f" ({unread})"
+            maxlen = PANEL_WIDTH - 4
+            if len(display_label) > maxlen:
+                display_label = display_label[:maxlen-1] + "…"
+            out.append(('class:sidebar', "  " + display_label + "\n"))
+    else:
+        out.append(('class:sidebar', "  No DMs found!\n"))
+    out.append(('class:sidebar', "─────────────────\n"))
+    # --- Streams ---
+    stream_unread = {}
+    for key, count in unread_tracker.items():
+        if key.startswith("stream:") and count > 0:
+            _, stream, topic = key.split(":", 2)
+            stream_unread[stream] = stream_unread.get(stream, 0) + count
+    stream_list = sorted(streams)
+    current_stream = chat_state.get('current_stream')
+    out.append(('class:sidebar', "─── Streams ──────\n"))
+    for stream in stream_list:
+        count = stream_unread.get(stream, 0)
+        label = f"{stream} ({count})" if count > 0 else stream
+        maxlen = PANEL_WIDTH - 4
+        if len(label) > maxlen:
+            label = label[:maxlen-1] + "…"
+        style = 'class:notify_stream' if stream == current_stream else 'class:sidebar'
+        out.append((style, "  " + label + "\n"))
+    if not stream_list:
+        out.append(('class:sidebar', "  No streams found!\n"))
+    out.append(('class:sidebar', "─────────────────\n"))
+    return out
 kb = KeyBindings()
 
 @kb.add('up')
@@ -860,9 +894,7 @@ def main():
     t1 = threading.Thread(target=fetch_new_messages_loop, daemon=True)
     t2 = threading.Thread(target=update_sidebar, daemon=True)
     t3 = threading.Thread(target=refresh_sidebar, args=(app,), daemon=True)
-    t4 = threading.Thread(target=update_notifybar, daemon=True)
-    t5 = threading.Thread(target=refresh_notifybar, args=(app,), daemon=True)
-    t1.start(); t2.start(); t3.start(); t4.start(); t5.start()
+    t1.start(); t2.start(); t3.start()
     with patch_stdout():
         app.run()
     stop_event.set()
