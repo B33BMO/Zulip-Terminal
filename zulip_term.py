@@ -371,7 +371,7 @@ def render_visible_messages():
     for msg in visible:
         if msg.get('id', None) == -1:
             lines.append(('', f"[System]: {msg.get('content', '')}\n"))
-            # Always add a blank line after system messages
+            # Always add a blank line after system messages, looks better
             lines.append(('', '\n'))
             prev_sender = None
         else:
@@ -504,7 +504,7 @@ def auto_fetch_history():
             break
         # Optionally print status to chat window
         print_system("(Auto-loading older chat history...)")
-        time.sleep(0.5)  # Avoid hammering the API
+        time.sleep(0.5)  # Avoid hammering the API (ish)
 
 def append_new_messages():
     global msg_history, msg_id_set, chat_scroll_pos
@@ -640,9 +640,9 @@ def conversations_sidebar_text():
     out = []
     # --- DMs ---
     out.append(('class:sidebar', "─── DMs ──────────\n"))
-    # Fetch recent DMs (even read ones!)
+    # Fetch recent DMs 
     recent_dms = fetch_recent_dm_conversations(limit=20)
-    # Build unread count map (unchanged)
+    # Build unread count map 
     dm_unread = {}
     for key, count in unread_tracker.items():
         if key.startswith("dm:"):
@@ -691,7 +691,7 @@ def scroll_up(event):
     if chat_scroll_pos + 1 >= len(msg_history) - VISIBLE_WINDOW + 1:
         loaded = lazy_load_older_messages()
         if loaded:
-            # Keep you at the same visual spot - working!!!!
+            # Keep you at the same visual spot - working!!!! until i break it
             chat_scroll_pos += len([m for m in msg_history if isinstance(m, dict) and 'id' in m]) - len(msg_history)
         event.app.invalidate()
     elif chat_scroll_pos + 1 < len(msg_history) - VISIBLE_WINDOW + 1:
@@ -861,7 +861,7 @@ def fetch_new_messages_loop():
             # If youit were at bottom AND got new messages, snap to bottom
             if was_at_bottom and new_msgs:
                 chat_scroll_pos = 0
-            # If NOT at bottom, NEVER force chat_scroll_pos (pain in my ass)
+            # If NOT at bottom, NEVER force chat_scroll_pos will break, because why not
             elif chat_scroll_pos > max_scroll:
                 chat_scroll_pos = max_scroll
             elif chat_scroll_pos < 0:
