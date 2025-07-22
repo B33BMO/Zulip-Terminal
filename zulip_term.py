@@ -1,54 +1,103 @@
-
-# Helper to fetch recent DMs (even read ones)
-def fetch_recent_dm_conversations(limit=20):
-    # This returns a list of tuples (label, last_msg_id)
-    try:
-        res = client.get_messages({
-            "anchor": "newest",
-            "num_before": limit,
-            "num_after": 0,
-            "narrow": [{"operator": "is", "operand": "dm"}],
-        })
-        dm_labels = {}
-        for m in res.get("messages", []):
-            if m['type'] == 'private':
-                # Get all user names except self
-                if isinstance(m['display_recipient'], list):
-                    emails = [u['email'] for u in m['display_recipient'] if u['email'] != client.email]
-                else:
-                    emails = [m['display_recipient']] if m['display_recipient'] != client.email else []
-                names = []
-                for email in sorted(emails):
-                    for u in users:
-                        if u['email'] == email:
-                            names.append(u['full_name'])
-                label = ",".join(names)
-                if label:
-                    if label not in dm_labels or m['id'] > dm_labels[label]:
-                        dm_labels[label] = m['id']
-        # Return sorted list (most recent first)
-        return sorted(dm_labels.items(), key=lambda t: -t[1])
-    except Exception as e:
-        return []
 import subprocess
 import os
-try:
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
-    subprocess.run(
-        ["git", "-C", repo_dir, "pull"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-except Exception:
-    pass
-
-prefetch_history_enabled = True  
 import sys
-import subprocess
+import threading
+import time
+import re
+from bs4 import BeautifulSoup
+from prompt_toolkit.application import Application
+from prompt_toolkit.layout import HSplit, Window, Layout
+from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import Frame
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.application.current import get_app
+from datetime import datetime
+from textwrap import indent
+import functools
+def get_context_bar_lines():
+    if chat_state['current_dm']:
+        target = [u['full_name'] for u in users if u['email'] == chat_state['current_dm']]
+        name = target[0] if target else chat_state['current_dm']
+        return [('', f" Direct Message: {name} ".center(60, '─'))]
+    elif chat_state['current_stream'] and chat_state['current_topic']:
+        return [('', f" {chat_state['current_stream']} > {chat_state['current_topic']} ".center(60, '─'))]
+    elif chat_state['current_stream']:
+        return [('', f" {chat_state['current_stream']} (all topics) ".center(60, '─'))]
+    else:
+        return [('', ' No stream or DM selected '.center(60, '─'))]
 
+def zulip_time(ts):
+    try:
+        dt = datetime.fromtimestamp(ts)
+        return dt.strftime("%a %b %d %I:%M %p")
+    except Exception:
+        return ""
+
+def render_msg_line(msg):
+    if msg.get('id', None) == -1:
+        # System message
+        return [('', f"[System]: {msg.get('content', '')}\n"), ('', '\n')]
+    # Tag: Stream-topic or DM
+    if chat_state['current_dm']:
+        context_tag = "[DM]"
+    else:
+        topic = msg.get('subject') or chat_state.get('current_topic') or "unknown"
+        context_tag = f"[{msg.get('display_recipient', chat_state.get('current_stream', ''))}-{topic}]"
+    sender = msg['sender_full_name']
+    tstamp = zulip_time(msg['timestamp'])
+    color_class = username_color_class(sender)
+    head = f"{context_tag} [{sender}] ".ljust(38)
+    head += "--------------------- "
+    head += f"[{tstamp}]"
+    lines = [(f"class:{color_class}", head + "\n")]
+    # Indent body 4 spaces
+    body = clean_message_html(msg['content'])
+    for line in body.splitlines() or ['']:
+        lines.append(('', f"    {line}\n"))
+    # Always add a blank line after each message (padding)
+    lines.append(('', '\n'))
+    return lines
+
+def threaded_message_lines():
+    real_msgs = [m for m in msg_history if isinstance(m, dict) and 'id' in m]
+    real_msgs.sort(key=lambda m: m['id'])
+    lines = []
+    for msg in real_msgs:
+        lines += render_msg_line(msg)
+    return lines if lines else [('', '[No messages to display]\n'), ('', '\n')]
+
+def render_visible_messages():
+    if show_help_screen and not (chat_state.get('current_dm') or chat_state.get('current_stream')):
+        return get_help_screen_lines()
+    lines = get_context_bar_lines() + threaded_message_lines()
+    flat_lines = []
+    for style, text in lines:
+        for part in text.splitlines(True):
+            flat_lines.append((style, part))
+    window_size = get_dynamic_visible_window()
+    total_lines = len(flat_lines)
+    # If at bottom, show the last window_size lines
+    if chat_scroll_pos_lines == 0:
+        visible = flat_lines[-window_size:]
+    else:
+        start = max(0, total_lines - window_size - chat_scroll_pos_lines)
+        end = total_lines - chat_scroll_pos_lines
+        visible = flat_lines[start:end]
+    # --- Guarantee a blank line at the very end always
+    if not visible or visible[-1][1].strip() != "":
+        visible.append(("", "\n"))
+    return visible if visible else [('', '[No messages to display]\n'), ('', '\n')]
+chat_scroll_pos_lines = 0  # 0 means bottom, N means scrolled up N lines
+
+# --- Help screen toggle
+show_help_screen = True
+
+# --- Dependency check
 REQUIRED_PACKAGES = ['zulip', 'prompt_toolkit', 'bs4']
-
 def check_and_install_packages():
     missing = []
     for pkg in REQUIRED_PACKAGES:
@@ -63,58 +112,17 @@ def check_and_install_packages():
             python_exe = sys.executable
             for pkg in missing:
                 print(f"Installing {pkg}...")
-                # Always use --break-system-packages to allow install in system python because FUCK envs!!!
                 subprocess.check_call([python_exe, "-m", "pip", "install", "--break-system-packages", pkg])
             print("All dependencies installed. Please restart the script.")
             sys.exit(0)
         else:
             print("Cannot continue without required packages.")
             sys.exit(1)
-
 check_and_install_packages()
 
 import zulip
-import queue
-event_queue = queue.Queue()
-def global_event_handler(event):
-    if event['type'] == 'message':
-        msg = event['message']
-        # Only count messages not sent by self
-        if msg.get('sender_email') and msg['sender_email'] != client.email:
-            if msg['type'] == 'stream':
-                key = _get_stream_topic_key(msg['display_recipient'], msg['subject'])
-                unread_tracker[key] = unread_tracker.get(key, 0) + 1
-            elif msg['type'] == 'private':
-                if isinstance(msg['display_recipient'], list):
-                    emails = [u['email'] for u in msg['display_recipient'] if u['email'] != client.email]
-                else:
-                    emails = [msg['display_recipient']] if msg['display_recipient'] != client.email else []
-                key = _get_dm_key(emails)
-                unread_tracker[key] = unread_tracker.get(key, 0) + 1
-            else:
-                pass
-        #Queue up for UI update
-        event_queue.put("update_notifybar")
-
-def run_global_event_loop():
-    client.call_on_each_event(global_event_handler, event_types=["message"])
-import os
-import threading
-import time
-from prompt_toolkit.application import Application
-from prompt_toolkit.layout import HSplit, VSplit, Window, Layout
-from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Frame
-from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.patch_stdout import patch_stdout
-from bs4 import BeautifulSoup
 
 CONFIG = os.path.expanduser("~/.zuliprc")
-
-# Check if ~/.zuliprc exists, prompt for credentials if not
 if not os.path.exists(CONFIG):
     print("No ~/.zuliprc found!")
     print("Let's create one.")
@@ -127,69 +135,25 @@ if not os.path.exists(CONFIG):
     sys.exit(0)
 
 client = zulip.Client(config_file=CONFIG)
-# Print out the Zulip email for debugging
 try:
     client.email = client.email if hasattr(client, 'email') else client.get_profile()['email']
 except Exception:
     client.email = None
-#
-# Fixes scrolling bug by using fixed window size
-VISIBLE_WINDOW = 14
-chat_scroll_pos = 0  # 0 means "bottom"
+
+stop_event = threading.Event()
+chat_state = {'current_stream': None, 'current_topic': None, 'current_dm': None}
 msg_history = []
 msg_id_set = set()
 earliest_msg_id = None
+chat_scroll_pos = 0
+VISIBLE_WINDOW_MIN = 4
 
-style = Style.from_dict({
-    'sidebar':          '#bfc7d5',
-    'online':           'bold #00ff00',
-    'away':             'bold #ff9500',
-    'offline':          'bold #888888',
-    'input':            ' #ffffff',
-    'prompt':           'bold #ffffff',
-    'output':           '',
-    'user_0':           'bold red',
-    'user_1':           'bold green',
-    'user_2':           'bold yellow',
-    'user_3':           'bold blue',
-    'user_4':           'bold magenta',
-    'user_5':           'bold cyan',
-    'user_6':           'bold white',
-    'user_7':           'bold #888888',
-    'notifybar':        '#ffffff',
-    'notify_count':     'bold #ffff00',
-    'notify_count_high':'bold #ff3333',
-    'notify_none':      '#888888',
-    'notify_stream':    '#5ad',
-    'notify_dm':        '#ffb347',
-    'notify_friendly':  'italic #aaaaff',
-})
-import collections
-
-# --- Stream abbreviations for notification bar ---
-STREAM_ABBREVIATIONS = {
-    "System Notifications": "SN",
-    "Ticket updates": "TU",
-    "Development": "DEV",
-    "IT": "IT",
-    "Mail Security": "MS",
-    "Monitoring": "MON",
-    "Client Updating": "CU",
-}
-
-notifybar_lock = threading.Lock()
-notifybar_data = []
-
-# --- Unread tracking logic ---
-# Module-level tracker for unread counts
 unread_tracker = {}
 
 def _get_stream_topic_key(stream, topic):
     return f"stream:{stream}:{topic}"
 
 def _get_dm_key(user_emails):
-    # user_emails: list of emails (excluding self)
-    # Sort for canonical order, map to full names
     names = []
     for email in sorted(user_emails):
         for u in users:
@@ -198,24 +162,8 @@ def _get_dm_key(user_emails):
     return "dm:" + ",".join(names)
 
 def mark_convo_as_read(key):
-    # Reset unread count for a given key
     if key in unread_tracker:
         unread_tracker[key] = 0
-
-def get_unread_counts():
-    # Returns: list of tuples
-    # Only include counts > 0
-    counts = []
-    for key, count in unread_tracker.items():
-        if count > 0:
-            if key.startswith("stream:"):
-                _, stream, topic = key.split(":", 2)
-                counts.append(('stream', f"{stream}:{topic}", count))
-            elif key.startswith("dm:"):
-                label = key[3:]
-                counts.append(('dm', label, count))
-    return counts
-
 
 def get_users():
     resp = client.get_users()
@@ -228,8 +176,7 @@ def get_streams():
 def get_topics(stream):
     response = client.get_stream_topics(stream)
     if response['result'] == 'success' and len(response['topics']) > 0:
-        topics = [t['name'] for t in response['topics']]
-        return topics
+        return [t['name'] for t in response['topics']]
     found_topics = set()
     anchor = 1000000000
     try:
@@ -244,20 +191,111 @@ def get_topics(stream):
                 found_topics.add(msg['subject'])
     except Exception as e:
         print(f"Error scraping messages: {e}")
-    topics = list(found_topics)
-    return topics
+    return list(found_topics)
 
 users = get_users()
 user_map = {u['email']: u for u in users}
 user_names = [u['full_name'] for u in users]
 streams = get_streams()
+topic_cache = {}
+# Pre-fill topic_cache at startup using threads
+import concurrent.futures
+def prefill_topic_cache():
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        results = list(executor.map(get_topics, streams))
+    for s, topics in zip(streams, results):
+        topic_cache[s] = topics
+prefill_topic_cache()
+
+notification_blink_flag = [False]
+def get_notification_list():
+    notif_list = []
+    for key, count in unread_tracker.items():
+        if count > 0 and key.startswith('dm:'):
+            notif_list.append((key, count))
+    return notif_list
+def render_notification_bar():
+    notif_list = get_notification_list()
+    if notif_list:
+        display = " | ".join([f"{k[3:]} ({c})" for k, c in notif_list])
+        if notification_blink_flag[0]:
+            return [("bg:#ff0000 #fff bold", f"   {display} ")]
+        else:
+            return [("bg:#222222 #fff", f"   {display} ")]
+    else:
+        return [("class:notifybar", "  No notifications ")]
+
+# --- Stream sidebar with unread counts ---
+def render_stream_sidebar():
+    sidebar_lines = []
+    for s in streams:
+        topics = topic_cache.get(s, [])
+        unread = sum(
+            unread_tracker.get(_get_stream_topic_key(s, t), 0)
+            for t in topics
+        )
+        if unread > 0:
+            sidebar_lines.append(
+                [("bold #fff", f"{s} ("), ("bold #ff0000", f"{unread}"), ("bold #fff", ")")]
+            )
+        else:
+            sidebar_lines.append([("", f"{s}")])
+    out = []
+    for line in sidebar_lines:
+        for part in line:
+            out.append(part)
+        out.append(("", "\n"))
+    return out if out else [("", "\n")]
+
+def render_stream_sidebar_window():
+    # Used as FormattedTextControl.text for sidebar Window
+    return render_stream_sidebar()
+
+def notification_blinker(app):
+    while not stop_event.is_set():
+        notif_list = get_notification_list()
+        if notif_list:
+            notification_blink_flag[0] = not notification_blink_flag[0]
+        else:
+            notification_blink_flag[0] = False
+        app.invalidate()
+        time.sleep(0.5)
+
+style = Style.from_dict({
+    'notifybar':    'bg:#222222 #ffffff bold',
+    'output':       '',
+    'input':        ' #ffffff',
+    'prompt':       'bold #ffffff',
+    'user_0':       'bold red',
+    'user_1':       'bold green',
+    'user_2':       'bold yellow',
+    'user_3':       'bold blue',
+    'user_4':       'bold magenta',
+    'user_5':       'bold cyan',
+    'user_6':       'bold white',
+    'user_7':       'bold #888888',
+    # To extend for >8 users, add more user_N classes and update username_color_class accordingly.
+})
+
+def get_dynamic_visible_window():
+    try:
+        app = get_app()
+        info = chat_window.render_info
+        if info is not None:
+            return max(VISIBLE_WINDOW_MIN, info.window_height - 2)
+        else:
+            return VISIBLE_WINDOW_MIN
+    except Exception:
+        return VISIBLE_WINDOW_MIN
 
 def clean_message_html(content):
     soup = BeautifulSoup(content, "html.parser")
     for code_tag in soup.find_all(['code', 'pre']):
-        code_tag.insert_before('\n'); code_tag.insert_after('\n')
+        code_tag.insert_before('\n')
+        code_tag.insert_after('\n')
     for a in soup.find_all('a'):
-        text = a.get_text(); href = a.get('href')
+        text = a.get_text()
+        href = a.get('href')
         if href and href != text:
             a.replace_with(f"{text} ({href})")
         else:
@@ -265,74 +303,12 @@ def clean_message_html(content):
     for tag in soup.find_all(['img', 'div', 'span']):
         tag.decompose()
     cleaned = soup.get_text(separator=" ", strip=True)
-    import re
-    # --- Zulip image link patch ---
-    # Find Zulip image upload paths and convert to OSC 8 hyperlink broken... ish
-    def make_link(m):
-        path = m.group(1)
-        filename = path.split("/")[-1]
-        url = f"https://zulip.cyburity.com{path}"
-        return f"\x1b]8;;{url}\x1b\\{filename}\x1b]8;;\x1b\\"
-    cleaned = re.sub(r"(/user_uploads/[^\s)]+)", make_link, cleaned)
+    def url_repl(m):
+        url = m.group(0)
+        display = url if len(url) <= 60 else "link"
+        return f"\n\x1b]8;;{url}\x1b\\{display}\x1b]8;;\x1b\\\n"
+    cleaned = re.sub(r'(https?://[^\s)]+)', url_repl, cleaned)
     return " ".join(cleaned.split())
-
-sidebar_users = {
-    'online': [],
-    'away': [],
-    'offline': []
-}
-sidebar_lock = threading.Lock()
-stop_event = threading.Event()
-def update_visible_window_size():
-    #  window size is fixed to avoid scrolling bug. :(
-    pass
-
-
-
-
-def update_sidebar():
-    while not stop_event.is_set():
-        presence = client.call_endpoint('realm/presence', method='GET').get("presences", {})
-        online, away, offline = [], [], []
-        for email, data in presence.items():
-            status = data.get("aggregated", {}).get("status", "offline")
-            user = user_map.get(email, {"full_name": email})
-            if status == "active":
-                online.append(user['full_name'])
-            elif status == "idle":
-                away.append(user['full_name'])
-            else:
-                offline.append(user['full_name'])
-        with sidebar_lock:
-            sidebar_users['online'] = sorted(online)
-            sidebar_users['away'] = sorted(away)
-            sidebar_users['offline'] = sorted(offline)
-        time.sleep(2)
-
-def sidebar_text():
-    with sidebar_lock:
-        out = []
-        out.append(('class:sidebar', "─── Users ────────\n"))
-        out.append(('class:online',   "Online:\n"))
-        if sidebar_users['online']:
-            for name in sidebar_users['online']:
-                out.append(('class:online', f"  ● {name}\n"))
-        else:
-            out.append(('class:sidebar', "  (None)\n"))
-        out.append(('class:away', "Away:\n"))
-        if sidebar_users['away']:
-            for name in sidebar_users['away']:
-                out.append(('class:away', f"  ● {name}\n"))
-        else:
-            out.append(('class:sidebar', "  (None)\n"))
-        out.append(('class:offline', "Offline:\n"))
-        if sidebar_users['offline']:
-            for name in sidebar_users['offline']:
-                out.append(('class:offline', f"  ● {name}\n"))
-        else:
-            out.append(('class:sidebar', "  (None)\n"))
-        out.append(('class:sidebar', "─────────────────\n"))
-        return out
 
 def username_color_class(name):
     return f"user_{abs(hash(name)) % 8}"
@@ -340,57 +316,43 @@ def username_color_class(name):
 def msg_to_fmt(msg):
     color_class = username_color_class(msg['sender_full_name'])
     content = clean_message_html(msg['content'])
-    return [
-        (f"class:{color_class}", f"[{msg['sender_full_name']}]"),
-        ("", f": {content}\n")
-    ]
-
-def render_visible_messages():
-    global chat_scroll_pos
-    real_msgs = [m for m in msg_history if isinstance(m, dict) and 'id' in m]
-    real_msgs.sort(key=lambda m: m['id'])
-
-    total_msgs = len(real_msgs)
-    if total_msgs == 0:
-        return [('', '[No messages to display]\n')]
-
-    max_scroll = max(0, total_msgs - VISIBLE_WINDOW)
-
-    if chat_scroll_pos == 0:
-        visible = real_msgs[-VISIBLE_WINDOW:]
-    else:
-        start = max(0, total_msgs - VISIBLE_WINDOW - chat_scroll_pos)
-        end = total_msgs - chat_scroll_pos
-        visible = real_msgs[start:end]
-
-    lines = []
-    # Prepend system banner if only stream is selected (no topic)
-    if chat_state.get('current_stream') and not chat_state.get('current_topic'):
-        lines.append(('', f"[System]: Viewing ALL topics in stream: {chat_state['current_stream']} (Read-only, pick a topic to send a message)\n"))
-    prev_sender = None
-    for msg in visible:
-        if msg.get('id', None) == -1:
-            lines.append(('', f"[System]: {msg.get('content', '')}\n"))
-            # Always add a blank line after system messages, looks better
-            lines.append(('', '\n'))
-            prev_sender = None
-        else:
-            # If sender changes (and not first message), insert blank line for separation
-            if prev_sender is not None and prev_sender != msg['sender_full_name']:
-                lines.append(('', '\n'))
-            lines += msg_to_fmt(msg)
-            # Always add a blank line after each message for extra padding
-            lines.append(('', '\n'))
-            prev_sender = msg['sender_full_name']
+    url_regex = re.compile(r'(https?://[^\s]+)')
+    urls = url_regex.findall(content)
+    content_wo_urls = url_regex.sub('', content).strip()
+    lines = [(f"class:{color_class}", f"[{msg['sender_full_name']}]"), ("", f": {content_wo_urls}\n")]
+    for url in urls:
+        label = url if len(url) <= 60 else "link"
+        osc8 = f"\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\"
+        lines.append(("", f"{osc8}\n"))
+    # Add extra blank line for vertical spacing after message body
+    lines.append(('', '\n'))
     return lines
+
+def get_help_screen_lines():
+    help_lines = [
+        ('class:notifybar', "─── Zulip Terminal Client Help ───\n"),
+        ('', "Welcome! Type a command or use Tab to autocomplete.\n"),
+        ('', "Commands:\n"),
+        ('class:prompt', "  /stream <stream> [topic]   "), ('', "Switch to a stream (all topics) or to a stream+topic\n"),
+        ('class:prompt', "  /dm <user>                 "), ('', "Start or view a DM with a user\n"),
+        ('class:prompt', "  /users                     "), ('', "List all users\n"),
+        ('class:prompt', "  /online                    "), ('', "Show users who are online or away\n"),
+        ('class:prompt', "  /search <term>             "), ('', "Search messages (across all streams, topics, DMs)\n"),
+        ('class:prompt', "  /window <lines>            "), ('', "Set min visible window size\n"),
+        ('class:prompt', "  /help                      "), ('', "Show this help screen again\n"),
+        ('class:prompt', "  /exit                      "), ('', "Quit\n"),
+        ('', "\nScroll: Up/Down/PageUp/PageDown   |   Refresh: Ctrl+L\n"),
+    ]
+    return help_lines
+
+
 
 def is_at_bottom():
     real_msgs = [m for m in msg_history if isinstance(m, dict) and 'id' in m]
-    return chat_scroll_pos <= 0 or len(real_msgs) <= VISIBLE_WINDOW
+    window_lines = get_dynamic_visible_window()
+    return chat_scroll_pos <= 0 or len(real_msgs) <= window_lines
 
-# Ensure chat messages wrap lines in the terminal window.
 chat_window = Window(content=FormattedTextControl(text=render_visible_messages), wrap_lines=True)
-
 def print_system(msg):
     msg_history.append({
         "id": -1,
@@ -403,7 +365,6 @@ def load_all_messages():
     current_stream = chat_state['current_stream']
     current_topic = chat_state['current_topic']
     current_dm = chat_state['current_dm']
-
     if current_dm:
         narrow = [{"operator": "pm-with", "operand": current_dm}]
     elif current_stream and current_topic:
@@ -418,18 +379,16 @@ def load_all_messages():
     else:
         print_system("Pick a DM or stream first.")
         return
-
+    window_lines = get_dynamic_visible_window()
     res = client.get_messages({
         "anchor": "newest",
-        "num_before": VISIBLE_WINDOW,
+        "num_before": window_lines,
         "num_after": 0,
         "narrow": narrow,
     })
-
     if res['result'] != 'success':
         print_system(f"Failed to fetch: {res.get('msg', 'Unknown error')}")
         return
-
     messages = res['messages']
     msg_history.clear()
     msg_id_set.clear()
@@ -439,15 +398,9 @@ def load_all_messages():
         earliest_msg_id = msg_history[0]['id']
     else:
         earliest_msg_id = None
-    chat_scroll_pos = 0
+    force_scroll_to_bottom()
     print_system(f"(Loaded {len(msg_history)} messages.)")
 
-    # Start background prefetch of old messages
-    if prefetch_history_enabled:
-        threading.Thread(target=auto_fetch_history, daemon=True).start()
-
-
-# Lazy load older messages for scrolling up
 def lazy_load_older_messages():
     global msg_history, msg_id_set, earliest_msg_id, chat_scroll_pos
     if earliest_msg_id is None:
@@ -455,7 +408,6 @@ def lazy_load_older_messages():
     current_stream = chat_state['current_stream']
     current_topic = chat_state['current_topic']
     current_dm = chat_state['current_dm']
-
     if current_dm:
         narrow = [{"operator": "pm-with", "operand": current_dm}]
     elif current_stream and current_topic:
@@ -469,54 +421,34 @@ def lazy_load_older_messages():
         ]
     else:
         return False
-
+    window_lines = get_dynamic_visible_window()
     res = client.get_messages({
         "anchor": earliest_msg_id,
-        "num_before": VISIBLE_WINDOW,
+        "num_before": window_lines,
         "num_after": 0,
         "narrow": narrow,
     })
-
     if res['result'] != 'success':
         print_system(f"Failed to fetch older messages: {res.get('msg', 'Unknown error')}")
         return False
-
-    messages = res['messages'][:-1]  # Exclude anchor itself to prevent duplicate
+    messages = res['messages'][:-1]
     if not messages:
         print_system("(No more history to load.)")
         return False
-
     msg_history[0:0] = sorted(messages, key=lambda m: m['id'])
     msg_id_set.update(m['id'] for m in messages)
     earliest_msg_id = msg_history[0]['id']
     print_system(f"(Loaded {len(messages)} older messages.)")
     return True
 
-
-# Auto-fetch history in background
-def auto_fetch_history():
-    global earliest_msg_id
-    while not stop_event.is_set():
-        if earliest_msg_id is None:
-            break
-        loaded = lazy_load_older_messages()
-        if not loaded:
-            break
-        # Optionally print status to chat window
-        print_system("(Auto-loading older chat history...)")
-        time.sleep(0.5)  # Avoid hammering the API (ish)
-
 def append_new_messages():
     global msg_history, msg_id_set, chat_scroll_pos
     current_stream = chat_state['current_stream']
     current_topic = chat_state['current_topic']
     current_dm = chat_state['current_dm']
-
     if not msg_history:
         return False
-
     last_id = max(m['id'] for m in msg_history if isinstance(m, dict) and 'id' in m)
-
     if current_dm:
         narrow = [{"operator": "pm-with", "operand": current_dm}]
     elif current_stream and current_topic:
@@ -526,52 +458,58 @@ def append_new_messages():
         ]
     else:
         return False
-
     res = client.get_messages({
         "anchor": last_id,
         "num_before": 0,
         "num_after": 100,
         "narrow": narrow,
     })
-
     if res['result'] == 'success':
         new_msgs = [msg for msg in res['messages'] if msg['id'] > last_id and msg['id'] not in msg_id_set]
         if new_msgs:
             for msg in new_msgs:
                 msg_history.append(msg)
                 msg_id_set.add(msg['id'])
-                # --- Unread tracking ---
-                # Don't count messages sent by self
                 if msg.get('sender_email') and msg['sender_email'] != client.email:
                     if msg['type'] == 'stream':
                         key = _get_stream_topic_key(msg['display_recipient'], msg['subject'])
                         unread_tracker[key] = unread_tracker.get(key, 0) + 1
                     elif msg['type'] == 'private':
-                        # For 1:1 or group PMs, get all emails except self
                         if isinstance(msg['display_recipient'], list):
                             emails = [u['email'] for u in msg['display_recipient'] if u['email'] != client.email]
                         else:
                             emails = [msg['display_recipient']] if msg['display_recipient'] != client.email else []
                         key = _get_dm_key(emails)
                         unread_tracker[key] = unread_tracker.get(key, 0) + 1
-                    else:
-                        pass
             return True
     return False
 
+def force_scroll_to_bottom():
+    global chat_scroll_pos
+    chat_scroll_pos = 0
 
-
-sidebar_control = FormattedTextControl(text=sidebar_text)
-sidebar_window = Window(content=sidebar_control, style='class:sidebar', width=28, always_hide_cursor=True)
-
-# Adds @mention autocomplete for users using Zulip mention syntax -- untested!!
 class ZulipCompleter(Completer):
     def get_completions(self, doc, complete_event):
-        text = doc.text_before_cursor
-        # --- @mention autocomplete ---
-        if "@" in text:
+        text = doc.text_before_cursor.strip()
+        # Only provide for /stream, /dm, @mention, /users, /online, /search, /window, /help, /exit
+        for cmdName in ['/stream','/dm','/users','/online','/search','/exit','/window','/help']:
+            if cmdName.startswith(text):
+                yield Completion(cmdName, start_position=-len(text))
+        # /stream context: autocomplete stream names
+        if text.startswith('/stream'):
+            prefix = text[7:].strip().lower()
+            for s in streams:
+                if s.lower().startswith(prefix):
+                    yield Completion(s, start_position=-len(prefix))
+        # /dm context: autocomplete user names
+        elif text.startswith('/dm'):
+            prefix = text[3:].strip().lower()
+            for n in user_names:
+                if n.lower().startswith(prefix):
+                    yield Completion(n, start_position=-len(prefix))
+        # @mention context
+        elif "@" in text:
             last_at = text.rfind("@")
-            # Only trigger if at start or after space
             if last_at != -1 and (last_at == 0 or text[last_at-1].isspace()):
                 prefix = text[last_at + 1:].lower()
                 for name in user_names:
@@ -582,146 +520,76 @@ class ZulipCompleter(Completer):
                             display=f"@{name}",
                             style="fg:green"
                         )
-        # --- Existing completions for / commands --- all functional
-        if text.startswith('/stream'):
-            prefix = text[7:].strip().lower()
-            for s in streams:
-                if s.lower().startswith(prefix):
-                    yield Completion(s, start_position=-len(text[7:].strip()))
-        elif text.startswith('/topic'):
-            s = chat_state['current_stream']
-            prefix = text[6:].strip().lower()
-            if s:
-                for t in get_topics(s):
-                    if prefix in t.lower():
-                        yield Completion(t, start_position=-len(text[6:].strip()))
-        elif text.startswith('/dm'):
-            prefix = text[3:].strip().lower()
-            for n in user_names:
-                if n.lower().startswith(prefix):
-                    yield Completion(n, start_position=-len(text[3:].strip()))
-        elif text.startswith('/'):
-            for cmdName in ['/stream','/topic','/dm','/search','/exit']:
-                if cmdName.startswith(text):
-                    yield Completion(cmdName, start_position=-len(text))
 
 input_buffer = Buffer(completer=ZulipCompleter(), complete_while_typing=True)
 input_control = BufferControl(buffer=input_buffer, focus_on_click=True)
 input_window = Window(content=input_control, height=1, style='class:input')
 
-body = VSplit([
-    # Leftmost: Conversations list (DMs + Streams)
-    Frame(
-        Window(
-            content=FormattedTextControl(
-                text=lambda: conversations_sidebar_text()
-            ),
-            style='class:sidebar',
-            width=28,
-            always_hide_cursor=True
-        ),
-        title="Conversations",
-        style='class:sidebar'
-    ),
-    # Middle: Chat and input
-    HSplit([
-        Frame(chat_window, title="Chat", style="class:output"),
-        Frame(input_window, title="Message", style="class:prompt"),
-    ]),
-    # Rightmost: Presence sidebar (users)
-    Frame(sidebar_window, title="Presence", style='class:sidebar'),
-])
-
-layout = Layout(container=body, focused_element=input_window)
-
-
-def conversations_sidebar_text():
-    PANEL_WIDTH = 28
-    out = []
-    # --- DMs ---
-    out.append(('class:sidebar', "─── DMs ──────────\n"))
-    # Fetch recent DMs 
-    recent_dms = fetch_recent_dm_conversations(limit=20)
-    # Build unread count map 
-    dm_unread = {}
-    for key, count in unread_tracker.items():
-        if key.startswith("dm:"):
-            label = key[3:]
-            dm_unread[label] = count
-    if recent_dms and len(recent_dms) > 0:
-        for label, last_id in recent_dms:
-            unread = dm_unread.get(label, 0)
-            display_label = label
-            if unread > 0:
-                display_label += f" ({unread})"
-            maxlen = PANEL_WIDTH - 4
-            if len(display_label) > maxlen:
-                display_label = display_label[:maxlen-1] + "…"
-            out.append(('class:sidebar', "  " + display_label + "\n"))
+def input_context_title():
+    if chat_state['current_dm']:
+        target = [u['full_name'] for u in users if u['email'] == chat_state['current_dm']]
+        name = target[0] if target else chat_state['current_dm']
+        return f"[Direct Message: {name}] - :"
+    elif chat_state['current_stream'] and chat_state['current_topic']:
+        return f"[{chat_state['current_stream']} > {chat_state['current_topic']}] - :"
+    elif chat_state['current_stream']:
+        return f"[{chat_state['current_stream']} (all topics)] - :"
     else:
-        out.append(('class:sidebar', "  No DMs found!\n"))
-    out.append(('class:sidebar', "─────────────────\n"))
-    # --- Streams ---
-    stream_unread = {}
-    for key, count in unread_tracker.items():
-        if key.startswith("stream:") and count > 0:
-            _, stream, topic = key.split(":", 2)
-            stream_unread[stream] = stream_unread.get(stream, 0) + count
-    stream_list = sorted(streams)
-    current_stream = chat_state.get('current_stream')
-    out.append(('class:sidebar', "─── Streams ──────\n"))
-    for stream in stream_list:
-        count = stream_unread.get(stream, 0)
-        label = f"{stream} ({count})" if count > 0 else stream
-        maxlen = PANEL_WIDTH - 4
-        if len(label) > maxlen:
-            label = label[:maxlen-1] + "…"
-        style = 'class:notify_stream' if stream == current_stream else 'class:sidebar'
-        out.append((style, "  " + label + "\n"))
-    if not stream_list:
-        out.append(('class:sidebar', "  No streams found!\n"))
-    out.append(('class:sidebar', "─────────────────\n"))
-    return out
-kb = KeyBindings()
+        return "[No context] - :"
 
+from prompt_toolkit.layout import VSplit
+body = VSplit([
+    Window(width=20, content=FormattedTextControl(text=render_stream_sidebar_window), style="bg:#181818 #fff"),
+    HSplit([
+        Window(height=1, content=FormattedTextControl(text=render_notification_bar), style='class:notifybar'),
+        Frame(chat_window, title="Chat", style="class:output"),
+        Frame(input_window, title=lambda: input_context_title(), style="class:prompt"),
+    ])
+])
+layout = Layout(container=body, focused_element=input_window)
+def get_all_physical_lines():
+    # Returns the flat physical lines for threaded_message_lines() + context
+    lines = get_context_bar_lines() + threaded_message_lines()
+    flat_lines = []
+    for style, text in lines:
+        for part in text.splitlines(True):
+            flat_lines.append((style, part))
+    return flat_lines
+
+kb = KeyBindings()
 @kb.add('up')
 def scroll_up(event):
-    global chat_scroll_pos
-    # If we are at the oldest visible message, lazy load more
-    if chat_scroll_pos + 1 >= len(msg_history) - VISIBLE_WINDOW + 1:
-        loaded = lazy_load_older_messages()
-        if loaded:
-            # Keep you at the same visual spot - working!!!! until i break it
-            chat_scroll_pos += len([m for m in msg_history if isinstance(m, dict) and 'id' in m]) - len(msg_history)
-        event.app.invalidate()
-    elif chat_scroll_pos + 1 < len(msg_history) - VISIBLE_WINDOW + 1:
-        chat_scroll_pos += 1
+    global chat_scroll_pos_lines
+    max_scroll = max(0, len(get_all_physical_lines()) - get_dynamic_visible_window())
+    if chat_scroll_pos_lines < max_scroll:
+        chat_scroll_pos_lines += 1
         event.app.invalidate()
 
 @kb.add('down')
 def scroll_down(event):
-    global chat_scroll_pos
-    if chat_scroll_pos > 0:
-        chat_scroll_pos -= 1
+    global chat_scroll_pos_lines
+    if chat_scroll_pos_lines > 0:
+        chat_scroll_pos_lines -= 1
         event.app.invalidate()
 
 @kb.add('pageup')
 def page_up(event):
-    global chat_scroll_pos
-    page = 10
-    before = chat_scroll_pos
-    for _ in range(page):
-        kb.get_bindings_for_keys(('up',))[0].handler(event)
+    global chat_scroll_pos_lines
+    page = get_dynamic_visible_window()
+    max_scroll = max(0, len(get_all_physical_lines()) - page)
+    chat_scroll_pos_lines = min(chat_scroll_pos_lines + page, max_scroll)
     event.app.invalidate()
 
 @kb.add('pagedown')
 def page_down(event):
-    global chat_scroll_pos
-    page = 10
-    for _ in range(page):
-        kb.get_bindings_for_keys(('down',))[0].handler(event)
+    global chat_scroll_pos_lines
+    page = get_dynamic_visible_window()
+    chat_scroll_pos_lines = max(chat_scroll_pos_lines - page, 0)
     event.app.invalidate()
 
+@kb.add('c-l')
+def refresh_screen(event):
+    event.app.invalidate()
 @kb.add('enter')
 def accept_input(event):
     text = input_buffer.text.strip()
@@ -740,35 +608,117 @@ def get_email_from_name(name):
     return None
 
 def process_command(cmd):
-    global chat_scroll_pos, earliest_msg_id
+    global chat_scroll_pos, earliest_msg_id, VISIBLE_WINDOW_MIN, topic_cache, show_help_screen, chat_scroll_pos_lines
+    cmd = cmd.strip()
+    # /help always shows help screen
+    if cmd == "/help":
+        show_help_screen = True
+        chat_state['current_stream'] = None
+        chat_state['current_dm'] = None
+        chat_state['current_topic'] = None
+        print_system("Showing help screen. Enter a command to start chatting.")
+        return
+    # For any other command, turn off help
+    show_help_screen = False
+
+    # /users: List all users
+    if cmd == "/users":
+        userlist = sorted(user_names)
+        print_system("All users:\n" + "\n".join(f"  {name}" for name in userlist))
+        return
+    # /online: List online and away users
+    if cmd == "/online":
+        presence = client.call_endpoint('realm/presence', method='GET').get("presences", {})
+        online, away = [], []
+        for email, data in presence.items():
+            status = data.get("aggregated", {}).get("status", "offline")
+            user = user_map.get(email, {"full_name": email})
+            if status == "active":
+                online.append(user['full_name'])
+            elif status == "idle":
+                away.append(user['full_name'])
+        txt = ""
+        if online:
+            txt += "Online:\n" + "".join(f"  ● {n}\n" for n in sorted(online))
+        if away:
+            txt += "Away:\n" + "".join(f"  ● {n}\n" for n in sorted(away))
+        if not txt:
+            txt = "(No online/away users.)"
+        print_system(txt)
+        return
+    # /search <term>: search and highlight
+    if cmd.startswith("/search"):
+        q = cmd[len("/search"):].strip()
+        if not q:
+            print_system("(Usage: /search <term>)")
+        else:
+            print_system(f"(🔍 Searching for “{q}”…)\n")
+            res = client.get_messages({
+                "anchor": "newest",
+                "num_before": 30,
+                "num_after": 0,
+                "narrow": [{"operator": "search", "operand": q}],
+            })
+            msgs = res.get("messages", [])
+            msg_history.clear()
+            msg_id_set.clear()
+            q_lc = q.lower()
+            for m in msgs:
+                if m['id'] not in msg_id_set:
+                    # Highlight match in content
+                    content = m['content']
+                    regex = re.compile(re.escape(q), re.IGNORECASE)
+                    m['content'] = regex.sub(lambda m: f"<span style='color:#ff0;background:#f00'>{m.group(0)}</span>", content)
+                    msg_history.append(m)
+                    msg_id_set.add(m['id'])
+            chat_scroll_pos_lines = 0
+            if not msgs:
+                print_system("(No matches found.)")
+        return
+
+    # /stream <stream> [topic]: support both all-topics and narrowed views
     if cmd.startswith("/stream"):
         arg = cmd[7:].strip()
-        if arg in streams:
-            chat_state['current_stream'] = arg
+        if not arg:
+            print_system(f"(Usage: /stream <stream> [topic], Tab for completion.)")
+            return
+        parts = arg.split(None, 1)
+        stream_name = parts[0]
+        topic_name = parts[1].strip() if len(parts) > 1 else None
+        if stream_name not in streams:
+            print_system(f"(Stream '{stream_name}' not found. Use Tab for completion.)")
+            return
+        # If only stream is provided
+        if not topic_name:
+            chat_state['current_stream'] = stream_name
             chat_state['current_topic'] = None
             chat_state['current_dm'] = None
+            # Preload topics for the stream
+            if stream_name not in topic_cache:
+                topic_cache[stream_name] = get_topics(stream_name)
             load_all_messages()
             chat_scroll_pos = 0
-            print_system(f"(Selected stream: {arg})")
-        else:
-            print_system(f"(Invalid stream. Use tab for options.)")
-    elif cmd.startswith("/topic"):
-        if not chat_state['current_stream']:
-            print_system("(Set a stream first with /stream)")
+            print_system(f"(Viewing all topics in stream: {stream_name})")
             return
-        arg = cmd[6:].strip()
-        topics = get_topics(chat_state['current_stream'])
-        if arg in topics:
-            chat_state['current_topic'] = arg
-            chat_state['current_dm'] = None
-            load_all_messages()
-            chat_scroll_pos = 0
-            print_system(f"(Selected topic: {arg})")
-            # Mark stream:topic as read when opened
-            key = _get_stream_topic_key(chat_state['current_stream'], chat_state['current_topic'])
-            mark_convo_as_read(key)
         else:
-            print_system("(Invalid topic. Use tab for options.)")
+            # Stream and topic provided
+            if stream_name not in topic_cache:
+                topic_cache[stream_name] = get_topics(stream_name)
+            topics = topic_cache[stream_name]
+            if not topics:
+                print_system(f"No topics found in {stream_name}.")
+                return
+            # Accept topic if exists, else warn
+            if topic_name in topics:
+                chat_state['current_stream'] = stream_name
+                chat_state['current_topic'] = topic_name
+                chat_state['current_dm'] = None
+                load_all_messages()
+                chat_scroll_pos = 0
+                print_system(f"(Selected stream: {stream_name}, topic: {topic_name})")
+            else:
+                print_system(f"(Topic '{topic_name}' not found in stream '{stream_name}'. Available topics: {', '.join(topics)})")
+            return
     elif cmd.startswith("/dm"):
         arg = cmd[3:].strip()
         email = get_email_from_name(arg)
@@ -779,41 +729,26 @@ def process_command(cmd):
             load_all_messages()
             chat_scroll_pos = 0
             print_system(f"(Switched to DM with: {arg})")
-            # Mark DM as read when opened - figgety? Fidgety? Idk
             key = _get_dm_key([email])
             mark_convo_as_read(key)
         else:
-            print_system("(User not found. Use tab for options.)")
-    elif cmd.startswith("/search"):
-        q = cmd[len("/search"):].strip()
-        if not q:
-            print_system("(Usage: /search your keywords)")
-        else:
-            print_system(f"(🔍 Searching for “{q}”…)\n")
-            res = client.get_messages({
-                "anchor": "newest",
-                "num_before": 10,
-                "num_after": 0,
-                "narrow": [{"operator": "search", "operand": q}],
-            })
-            msgs = res.get("messages", [])
-            msg_history.clear()
-            msg_id_set.clear()
-            for m in msgs:
-                if m['id'] not in msg_id_set:
-                    msg_history.append(m)
-                    msg_id_set.add(m['id'])
-            chat_scroll_pos = 0
-            if not msgs:
-                print_system("(No matches found.)")
+            print_system("(User not found. Use Tab for completion.)")
     elif cmd.startswith("/exit"):
         stop_event.set()
         print_system("(Exiting Zulip terminal client. Peace out ✌️)")
         return "exit"
+    elif cmd.startswith("/window"):
+        arg = cmd[7:].strip()
+        if not arg.isdigit():
+            print_system("(Usage: /window <number-of-visible-lines>)")
+        else:
+            VISIBLE_WINDOW_MIN = max(4, int(arg))
+            print_system(f"(Set minimum visible window size to {VISIBLE_WINDOW_MIN}.)")
+            load_all_messages()
+            chat_scroll_pos = 0
     elif cmd.startswith("/"):
-        print_system("(Unknown command. Try /stream, /topic, /dm, /search, /exit)")
+        print_system("(Unknown command. Try /stream, /dm, /users, /online, /search, /window, /help, /exit)")
     else:
-        # Send message
         if chat_state['current_dm']:
             res = client.send_message({
                 "type": "private",
@@ -821,10 +756,9 @@ def process_command(cmd):
                 "content": cmd,
             })
             if res['result'] == 'success':
-                load_all_messages()       # <-- FULL reload, always! Otherwise... issues
-                chat_scroll_pos = 0       # <-- Snap to bottom
+                load_all_messages()
+                chat_scroll_pos = 0
                 print_system("(sent)")
-                # Mark DM as read after sending
                 key = _get_dm_key([chat_state['current_dm']])
                 mark_convo_as_read(key)
         elif chat_state['current_stream'] and chat_state['current_topic']:
@@ -845,56 +779,57 @@ def process_command(cmd):
         else:
             print_system("(Pick a stream/topic or DM first!)")
 
-
-chat_state = {'current_stream': None, 'current_topic': None, 'current_dm': None}
-
 def fetch_new_messages_loop():
     global chat_scroll_pos
     while not stop_event.is_set():
         try:
-            was_at_bottom = is_at_bottom()  # Only check ONCE,ONCE, before updating
-
+            was_at_bottom = is_at_bottom()
             new_msgs = append_new_messages()
             total_msgs = len([m for m in msg_history if isinstance(m, dict) and 'id' in m])
-            max_scroll = max(0, total_msgs - VISIBLE_WINDOW)
-
-            # If youit were at bottom AND got new messages, snap to bottom
+            window_lines = get_dynamic_visible_window()
+            max_scroll = max(0, total_msgs - window_lines)
             if was_at_bottom and new_msgs:
                 chat_scroll_pos = 0
-            # If NOT at bottom, NEVER force chat_scroll_pos will break, because why not
             elif chat_scroll_pos > max_scroll:
                 chat_scroll_pos = max_scroll
             elif chat_scroll_pos < 0:
                 chat_scroll_pos = 0
-
             chat_window.content.text = render_visible_messages
-
         except Exception as e:
             print(e)
         time.sleep(2)
 
-
-
-    
-def refresh_sidebar(app):
-    while not stop_event.is_set():
-        sidebar_control.text = sidebar_text()
-        app.invalidate()
-        time.sleep(2)
-
+def global_event_handler(event):
+    if event['type'] == 'message':
+        msg = event['message']
+        if msg.get('sender_email') and msg['sender_email'] != client.email:
+            if msg['type'] == 'stream':
+                key = _get_stream_topic_key(msg['display_recipient'], msg['subject'])
+                unread_tracker[key] = unread_tracker.get(key, 0) + 1
+            elif msg['type'] == 'private':
+                if isinstance(msg['display_recipient'], list):
+                    emails = [u['email'] for u in msg['display_recipient'] if u['email'] != client.email]
+                else:
+                    emails = [msg['display_recipient']] if msg['display_recipient'] != client.email else []
+                key = _get_dm_key(emails)
+                unread_tracker[key] = unread_tracker.get(key, 0) + 1
+def run_global_event_loop():
+    client.call_on_each_event(global_event_handler, event_types=["message"])
 
 def main():
-    print_system("--- ZULIP TERMINAL CLIENT ---")
-    print_system("Commands: /stream /topic /dm [name] /search <query> /exit")
-    print_system("Type messages and hit Enter. Scroll with Up/Down/PageUp/PageDown. Switch context with /stream or /dm.")
-    # Start global event loop thread before launching UI
+    global show_help_screen
+    print("MINIMALIST MODE ACTIVATED. No sidebars. Only notifications, chat, and input remain.\n")
+    print("Commands: /stream, /topic, /dm [name], /users, /online, /list, /search <query>, /window <lines>, /help, /exit")
+    print("Tab autocompletes streams, topics, users, and commands!")
+    # Show help screen (if no DM or stream selected)
+    show_help_screen = True
     t_event = threading.Thread(target=run_global_event_loop, daemon=True)
     t_event.start()
     app = Application(layout=layout, key_bindings=kb, style=style, full_screen=True)
     t1 = threading.Thread(target=fetch_new_messages_loop, daemon=True)
-    t2 = threading.Thread(target=update_sidebar, daemon=True)
-    t3 = threading.Thread(target=refresh_sidebar, args=(app,), daemon=True)
-    t1.start(); t2.start(); t3.start()
+    t2 = threading.Thread(target=notification_blinker, args=(app,), daemon=True)
+    t1.start()
+    t2.start()
     with patch_stdout():
         app.run()
     stop_event.set()
